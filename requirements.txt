@@ -1,0 +1,9 @@
+streamlit
+pandas
+rispy
+rapidfuzz
+numpy
+google-generativeai
+scikit-learn
+bibtexparser
+streamlit-shortcuts
