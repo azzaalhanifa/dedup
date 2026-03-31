@@ -7,6 +7,8 @@ import numpy as np
 import io
 import google.generativeai as genai
 import time
+import concurrent.futures
+import requests
 
 # --- KEYBOARD SHORTCUTS IMPORT ---
 try:
@@ -206,11 +208,9 @@ def parse_bib(file):
         data.append(entry)
     return pd.DataFrame(data)
 
-# --- AI AUTOSCREEN WITH CoT REASONING (March 2026 - FIXED MODEL NAMES) ---
-def auto_screen_paper_llm(api_key, protocol, title, abstract):
-    """Uses Gemini models, remembers exhaustion state across Streamlit reruns."""
-    genai.configure(api_key=api_key)
-    
+# --- REPLACED: AI AUTOSCREEN WITH REST API FOR THREAD SAFETY ---
+def auto_screen_thread_safe(idx, title, abstract, api_key, protocol):
+    """Thread-safe REST API caller that isolates API keys."""
     prompt = f"""
     You are an expert academic researcher conducting a Systematic Review and Meta-Analysis (SRMA).
     Evaluate the following paper against the user-defined screening protocol.
@@ -223,69 +223,45 @@ def auto_screen_paper_llm(api_key, protocol, title, abstract):
     Abstract: {abstract}
     
     ### INSTRUCTIONS:
-    1. Step-by-step reasoning: First, write a detailed <reasoning> block where you explicitly analyze the paper against EACH criteria in the protocol.
-    2. Final Decision: After your reasoning, provide your final decision inside a <decision> block. Must be exactly: Include, Exclude, or Maybe.
+    1. First, write a detailed <reasoning> block where you explicitly analyze the paper against EACH criteria.
+    2. Final Decision: provide your final decision inside a <decision> block. Must be exactly: Include, Exclude, or Maybe.
     """
     
-    models_to_try = [
-        'gemini-3-flash-preview',       
-        'gemini-3.1-flash-lite-preview' 
-    ]
+    models_to_try = ['gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview']
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    headers = {'Content-Type': 'application/json'}
     
-    max_retries = 3
-    retry_delay_seconds = 20 
-    
-    # Start iterating from the model that is currently known to be active
-    while st.session_state.active_model_index < len(models_to_try):
-        model_name = models_to_try[st.session_state.active_model_index]
+    for model in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
-                text = response.text.strip()
+                response = requests.post(url, headers=headers, json=payload)
                 
-                # --- NEW: Extract Decision AND Reasoning ---
-                dec_match = re.search(r'<decision>(.*?)</decision>', text, re.IGNORECASE | re.DOTALL)
-                decision = dec_match.group(1).strip().capitalize() if dec_match else text.split('\n')[-1].strip().capitalize()
-                decision = ''.join(e for e in decision if e.isalnum())
-                
-                res_match = re.search(r'<reasoning>(.*?)</reasoning>', text, re.IGNORECASE | re.DOTALL)
-                reasoning = res_match.group(1).strip() if res_match else "No reasoning provided."
-                
-                if decision in ["Include", "Exclude", "Maybe"]:
-                    return decision, reasoning
-                elif "Include" in decision:
-                    return "Include", reasoning
-                elif "Exclude" in decision:
-                    return "Exclude", reasoning
+                if response.status_code == 200:
+                    data = response.json()
+                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    
+                    dec_match = re.search(r'<decision>(.*?)</decision>', text, re.IGNORECASE | re.DOTALL)
+                    decision = dec_match.group(1).strip().capitalize() if dec_match else "Maybe"
+                    decision = ''.join(e for e in decision if e.isalnum())
+                    
+                    res_match = re.search(r'<reasoning>(.*?)</reasoning>', text, re.IGNORECASE | re.DOTALL)
+                    reasoning = res_match.group(1).strip() if res_match else "No reasoning provided."
+                    
+                    if "Include" in decision: return idx, "Include", reasoning
+                    elif "Exclude" in decision: return idx, "Exclude", reasoning
+                    else: return idx, "Maybe", reasoning
+                    
+                elif response.status_code == 429: # Rate Limit
+                    time.sleep(20) # Wait 20 seconds before retrying
                 else:
-                    return "Maybe", reasoning
+                    break # Break retry loop on other errors (like 400 Bad Request) and try next model
                     
             except Exception as e:
-                error_msg = str(e).lower()
+                time.sleep(5)
                 
-                if "quota" in error_msg:
-                    print(f"🚨 Model {model_name} Daily Quota (RPD) Exceeded. Switching models permanently.")
-                    st.session_state.active_model_index += 1 # Permanently move to next model
-                    break # Break retry loop
-                    
-                elif "429" in error_msg or "exhausted" in error_msg:
-                    print(f"⏳ Model {model_name} hit RPM limit (Attempt {attempt+1}/{max_retries}). Waiting {retry_delay_seconds}s...")
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay_seconds)
-                    else:
-                        print(f"⏭️ Model {model_name} RPM retries exhausted. Switching models permanently.")
-                        st.session_state.active_model_index += 1 # Permanently move to next model
-                
-                else:
-                    print(f"⚠️ Model {model_name} encountered an unexpected error: {error_msg[:100]}")
-                    st.session_state.active_model_index += 1 # Skip model on weird errors
-                    break 
-    
-    # If the while loop finishes, all models are exhausted
-    print("❌ Both Gemini models exhausted or failed → Halting batch screener")
-    return "HALT_RATE_LIMIT", "All models exhausted or failed."
+    return idx, "Maybe", "All models and retries exhausted for this thread."
 
 # --- DEDUPLICATION LOGIC ---
 def calculate_similarity(row1, row2):
@@ -300,14 +276,22 @@ def calculate_similarity(row1, row2):
     if not a1 or not a2: auth_score = title_score 
     else: auth_score = fuzz.token_set_ratio(a1, a2)
         
-    y1 = str(row1['Year']).strip()
-    y2 = str(row2['Year']).strip()
-    year_match = (y1 == y2 and y1 != "")
+    y1_str = str(row1['Year']).strip()
+    y2_str = str(row2['Year']).strip()
+    
+    # Safely extract the 4-digit year using regex to avoid ValueError
+    y1_match = re.search(r'\d{4}', y1_str)
+    y2_match = re.search(r'\d{4}', y2_str)
     
     weighted_score = (title_score * 0.75) + (auth_score * 0.25)
     
-    if year_match: weighted_score += 3
-    elif y1 and y2 and abs(int(y1) - int(y2)) > 1: weighted_score -= 10
+    if y1_match and y2_match:
+        y1_int = int(y1_match.group())
+        y2_int = int(y2_match.group())
+        if y1_int == y2_int: 
+            weighted_score += 3
+        elif abs(y1_int - y2_int) > 1: 
+            weighted_score -= 10
         
     return min(100, int(weighted_score))
 
@@ -326,7 +310,10 @@ def find_duplicates(df, threshold):
             
     candidates = df[~df.index.isin(processed_ids)].copy()
     candidates = candidates[candidates['norm_title'].astype(str).str.len() > 10]
-    if len(candidates) < 2: return duplicates
+    if len(candidates) < 2: 
+        # Sort before returning just in case there are exact DOI matches
+        duplicates.sort(key=lambda x: x['score'], reverse=True)
+        return duplicates
         
     vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4))
     tfidf_matrix = vectorizer.fit_transform(candidates['norm_title'])
@@ -345,6 +332,8 @@ def find_duplicates(df, threshold):
         if score >= threshold:
             duplicates.append({'type': 'Similarity', 'ids': [idx1, idx2], 'score': score})
             
+    # Sort from most similar (highest score) to least similar
+    duplicates.sort(key=lambda x: x['score'], reverse=True)
     return duplicates
 
 def auto_resolve(duplicates, df, criteria, min_similarity):
@@ -420,11 +409,21 @@ with st.sidebar:
         
     st.divider()
     st.markdown("### 🧠 LLM Auto-Screener")
-    st.session_state.api_key = st.text_input("Gemini API Key", type="password", help="Get a free key from Google AI Studio")
+    
+    # Let user select number of threads
+    st.session_state.num_threads = st.number_input("Number of AI Threads", min_value=1, max_value=10, value=1, help="More threads = faster screening, but requires more API keys.")
+    
+    # Generate dynamic API key inputs
+    st.session_state.api_keys = []
+    for i in range(st.session_state.num_threads):
+        key = st.text_input(f"Gemini API Key {i+1}", type="password", key=f"api_key_{i}")
+        if key.strip():
+            st.session_state.api_keys.append(key.strip())
+            
     st.session_state.srma_protocol = st.text_area(
         "Screening Protocol", 
         height=150, 
-        placeholder="1. Include RCTs and observational studies.\n2. Exclude animal models.\n3. Include studies on Diabetes Type 2.\n4. Exclude studies before 2010."
+        placeholder="1. Include RCTs and observational studies.\n2. Exclude animal models..."
     )
     
     # --- NEW: Reset Button ---
@@ -588,86 +587,77 @@ with tab4:
     if df_master.empty:
         st.info("No data loaded. Please upload your files in Tab 1 to begin.")
     else:
-        # --- Progress Bar ---
+        # --- Progress Bar & Live Stats ---
         total_valid = len(df_master[df_master['decision'] == 'Include'])
-        screened_count = len(df_master[(df_master['decision'] == 'Include') & (df_master['screening_status'] != 'Unscreened')])
+        screened_df = df_master[(df_master['decision'] == 'Include') & (df_master['screening_status'] != 'Unscreened')]
+        screened_count = len(screened_df)
+        
         if total_valid > 0:
             st.progress(screened_count / total_valid)
             st.caption(f"**Overall Screening Progress:** {screened_count} / {total_valid} ({int((screened_count/total_valid)*100)}%)")
+            
+            # --- NEW: Live Stats Columns ---
+            st.markdown("**Live Screening Stats:**")
+            stat_c1, stat_c2, stat_c3 = st.columns(3)
+            stat_c1.metric("🟢 Included", len(screened_df[screened_df['screening_status'] == 'Include']))
+            stat_c2.metric("🔴 Excluded", len(screened_df[screened_df['screening_status'] == 'Exclude']))
+            stat_c3.metric("🟡 Maybe", len(screened_df[screened_df['screening_status'] == 'Maybe']))
             st.divider()
 
-        # --- 🤖 AI BATCH AUTO-SCREENER (WITH PAUSE FUNCTIONALITY) ---
-        st.markdown("### 🤖 Batch Auto-Screener")
-        if st.session_state.get('api_key') and st.session_state.get('srma_protocol'):
+        # --- 🤖 AI MULTI-THREADED BATCH AUTO-SCREENER ---
+        st.markdown("### 🤖 Multi-Threaded Batch Auto-Screener")
+        
+        if len(st.session_state.get('api_keys', [])) > 0 and st.session_state.get('srma_protocol'):
             unscreened_df = st.session_state.master_df[(st.session_state.master_df['decision'] == 'Include') & (st.session_state.master_df['screening_status'] == 'Unscreened')]
             
             if not unscreened_df.empty:
-                st.info(f"There are **{len(unscreened_df)}** papers waiting to be screened.")
-                
-                # Check if we are currently in an active auto-screening loop
-                if st.session_state.is_auto_screening:
-                    st.warning("🔄 Auto-screening in progress. Please wait...")
+                # Check if the auto-screening loop is currently active
+                if st.session_state.get('is_auto_screening', False):
+                    st.warning("🔄 Auto-screening in progress...")
                     
-                    # --- NEW: Show previous reasoning while waiting ---
-                    if 'last_ai_title' in st.session_state and 'last_ai_reasoning' in st.session_state:
-                        with st.container(border=True):
-                            st.markdown(f"**Just Screened:** {st.session_state.last_ai_title}")
-                            st.markdown(f"**Decision:** `{st.session_state.last_ai_decision}`")
-                            st.markdown(f"**AI Reasoning:** \n> {st.session_state.last_ai_reasoning}")
-                    
-                    # Interruption Button
+                    # --- NEW: Functional Pause Button ---
                     if st.button("⏹️ Pause Auto-Screening", type="secondary"):
                         st.session_state.is_auto_screening = False
                         st.rerun()
-                        
-                    idx_to_screen = unscreened_df.index[0]
-                    row_to_screen = unscreened_df.loc[idx_to_screen]
                     
-                    st.text(f"Screening: {str(row_to_screen['Title'])[:60]}...")
+                    # Grab a small batch equal to the number of active threads
+                    num_threads = len(st.session_state.api_keys)
+                    batch_df = unscreened_df.head(num_threads)
                     
-                    # --- NEW: Unpack both variables ---
-                    ai_decision, ai_reasoning = auto_screen_paper_llm(
-                        st.session_state.api_key, 
-                        st.session_state.srma_protocol, 
-                        row_to_screen['Title'], 
-                        row_to_screen['Abstract']
-                    )
-                    
-                    # Check for exhaustion signal
-                    if ai_decision == "HALT_RATE_LIMIT":
-                        st.session_state.is_auto_screening = False
-                        st.error("🛑 Auto-screening halted! Both models have run out of tokens or hit their rate limits.")
-                        time.sleep(3) 
-                        st.rerun()
-                    else:
-                        # --- NEW: Apply Decision and Save Reasoning ---
-                        st.session_state.master_df.at[idx_to_screen, 'screening_status'] = ai_decision
-                        st.session_state.master_df.at[idx_to_screen, 'ai_reasoning'] = ai_reasoning
-                        
-                        # --- NEW: Save to session state for the next loop's UI ---
-                        st.session_state.last_ai_title = str(row_to_screen['Title'])
-                        st.session_state.last_ai_decision = ai_decision
-                        st.session_state.last_ai_reasoning = ai_reasoning
-                        
-                        # Final check before looping again
-                        if len(unscreened_df) <= 1:
-                            st.session_state.is_auto_screening = False
-                            st.success("✅ Auto-screening complete!")
-                            time.sleep(2)
-                        else:
-                            time.sleep(4) 
+                    with st.spinner(f"Screening batch of {len(batch_df)} papers..."):
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                            futures = []
+                            for i, (idx, row) in enumerate(batch_df.iterrows()):
+                                assigned_key = st.session_state.api_keys[i % num_threads]
+                                futures.append(
+                                    executor.submit(
+                                        auto_screen_thread_safe, 
+                                        idx, row['Title'], row['Abstract'], assigned_key, st.session_state.srma_protocol
+                                    )
+                                )
                             
-                        st.rerun()
+                            # Wait for this specific batch to finish
+                            for future in concurrent.futures.as_completed(futures):
+                                idx, decision, reasoning = future.result()
+                                # Update the master dataframe
+                                st.session_state.master_df.at[idx, 'screening_status'] = decision
+                                st.session_state.master_df.at[idx, 'ai_reasoning'] = reasoning
+                    
+                    # Rerun the app to update the UI stats and process the next batch!
+                    time.sleep(0.5) 
+                    st.rerun()
                     
                 else:
-                    if st.button("▶️ Start / Resume Auto-Screening", type="primary"):
+                    st.info(f"**{len(unscreened_df)}** papers waiting to be screened using **{len(st.session_state.api_keys)}** active threads.")
+                    if st.button("🚀 Start Multi-Threaded Screening", type="primary"):
                         st.session_state.is_auto_screening = True
                         st.rerun()
             else:
-                st.success("No unscreened papers left to auto-screen!")
+                st.success("✅ No unscreened papers left to auto-screen!")
                 st.session_state.is_auto_screening = False
         else:
-            st.info("👈 Enter your Gemini API Key and Screening Protocol in the sidebar to enable batch AI screening.")
+            st.info("👈 Enter your Gemini API Key(s) and Screening Protocol in the sidebar to enable batch AI screening.")
+        
         st.divider()
 
         # --- FILTER & SEARCH LOGIC ---
