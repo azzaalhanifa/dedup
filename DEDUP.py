@@ -755,7 +755,7 @@ with tab4:
                     if clean_doi: st.markdown(f"🔗 **DOI:** [{row['DOI']}](https://doi.org/{clean_doi}) (Opens in new tab)")
                 
                 st.markdown("**Abstract:**")
-                abstract_text = row['Abstract'] if row['Abstract'] else "No abstract available."
+                abstract_text = force_string(row['Abstract']) or "No abstract available."
                 
                 # Dynamic Search Highlighting
                 if st.session_state.search_query:
